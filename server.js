@@ -118,7 +118,7 @@ io.on('connection', (socket) => {
     // 📦 RECEPTION FLUX BASE64 PAR PIPELINE CONTINU
     socket.on('send_chunk', (data) => {
         const { fileId, chunkIndex, chunkData, totalChunks, roomId, name, mimeType } = data;
-        
+
         if (!activeTransfers.has(fileId)) {
             activeTransfers.set(fileId, {
                 roomId,
@@ -142,7 +142,7 @@ io.on('connection', (socket) => {
 
         if (transfer.chunksReceived === transfer.totalChunks) {
             console.log(`🚀 [STREAM DONE] ${transfer.name} réassemblé (${transfer.totalChunks} chunks Base64).`);
-            
+
             const finalContent = Buffer.concat(transfer.buffer);
 
             io.to(transfer.roomId).emit('receive_message', {
