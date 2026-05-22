@@ -2,25 +2,25 @@ const express = require('express');
 const app = express();
 const http = require('http').createServer(app);
 
-// Configuration Socket.io optimisée pour la production
+// Configuration Socket.io optimisée pour la production de masse
 const io = require('socket.io')(http, {
     cors: { origin: "*" },
-    pingTimeout: 3000,   // Si pas de réponse après 3s, on considère l'appareil déconnecté
-    pingInterval: 10000, // Envoie un ping toutes les 10s pour vérifier si l'app est ouverte
-    maxHttpBufferSize: 1e7 // Augmente la limite à 10 Mo pour autoriser des photos plus lourdes 🖼️
+    pingTimeout: 3000,   // Si pas de réponse après 3s, l'appareil est déconnecté
+    pingInterval: 10000, // Envoie un ping toutes les 10s pour maintenir le canal actif
+    maxHttpBufferSize: 1e7 // Limite à 10 Mo par paquet binaire max
 });
 
 const crypto = require('crypto');
 console.log(`\n🔥 BOOT ID: ${crypto.randomBytes(4).toString('hex').toUpperCase()}`);
 console.log(`📁 REAL PATH: ${__filename}\n`);
 
-// Le port est récupéré dynamiquement si tu le déploies en ligne, sinon 3001
 const PORT = process.env.PORT || 3001;
 
-// Base de données temporaire en RAM
+// Bases de données temporaires en RAM (Globales)
 let connectedUsers = new Map();
+const activeTransfers = new Map(); // Stockage des morceaux de fichiers en cours de stream
 
-// Algorithme d'Haversine optimisé
+// Algorithme d'Haversine de haute précision
 function getDistance(lat1, lon1, lat2, lon2) {
     const R = 6371000; // Rayon de la Terre en mètres
     const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -34,11 +34,10 @@ function getDistance(lat1, lon1, lat2, lon2) {
 io.on('connection', (socket) => {
     console.log(`🔌 [SERVEUR] Connexion établie -> ID: ${socket.id}`);
 
-    // 📍 RECEPTION & MATCHMAKING GPS AVEC CODE PIN DE SÉCURITÉ (Version Ultra-Stable)
+    // 📍 RECEPTION & MATCHMAKING GPS AVEC CODE PIN DE SÉCURITÉ
     socket.on('update_location', (coords) => {
         if (!coords || !coords.latitude || !coords.longitude) return;
 
-        // Récupération sécurisée de l'ancien état utilisateur pour éviter le ?.
         let currentUser = connectedUsers.get(socket.id) || { pin: null, isVerified: false };
 
         connectedUsers.set(socket.id, {
@@ -49,7 +48,7 @@ io.on('connection', (socket) => {
             isVerified: currentUser.isVerified
         });
 
-        // Boucle de vérification de proximité
+        // Boucle de détection de proximité
         for (let [otherId, otherUser] of connectedUsers.entries()) {
             if (otherId === socket.id) continue;
 
@@ -59,20 +58,18 @@ io.on('connection', (socket) => {
             if (distance <= 80) {
                 let myCurrentState = connectedUsers.get(socket.id);
 
-                // Si aucun PIN n'est généré pour ce duo, on crée un code unique
                 if (myCurrentState && !myCurrentState.pin && !otherUser.pin) {
-                    const sharedPin = Math.floor(1000 + Math.random() * 9000).toString(); // Ex: "4732"
+                    const sharedPin = Math.floor(1000 + Math.random() * 9000).toString();
 
                     myCurrentState.pin = sharedPin;
                     otherUser.pin = sharedPin;
 
-                    // On envoie le PIN aux deux appareils pour affichage
                     io.to(socket.id).emit('pin_generated', { pin: sharedPin, distance: distance.toFixed(1) });
                     io.to(otherId).emit('pin_generated', { pin: sharedPin, distance: distance.toFixed(1) });
                     console.log(`🔐 [PIN] Code ${sharedPin} généré pour la proximité.`);
                 }
             } else {
-                // Hors de portée -> Nettoyage strict
+                // Hors de portée -> Nettoyage de la room éphémère
                 if (socket.rooms.has(roomName)) {
                     socket.leave(roomName);
                     let targetSocket = io.sockets.sockets.get(otherId);
@@ -96,7 +93,6 @@ io.on('connection', (socket) => {
         if (user && user.pin === data.pin) {
             user.isVerified = true;
 
-            // Trouver l'autre utilisateur pour ouvrir la room
             for (let [otherId, otherUser] of connectedUsers.entries()) {
                 if (otherId !== socket.id && otherUser.pin === data.pin && otherUser.isVerified) {
                     const roomName = `room_${[socket.id, otherId].sort().join('_')}`;
@@ -112,27 +108,66 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 📤 ROUTAGE DES FLUX (Texte & Images Base64)
+    // 📤 ROUTAGE DES FLUX CLASSIQUES (Texte brut rapide)
     socket.on('send_to_room', (packageData) => {
         if (!packageData?.roomId || !packageData?.message) return;
-
         console.log(`📤 [PROPULSION] Flux type [${packageData.message.type}] envoyé dans la room : ${packageData.roomId}`);
-        // Émet à tout le monde dans le salon SAUF à l'émetteur
         socket.to(packageData.roomId).emit('receive_message', packageData.message);
     });
 
-    // ❌ NETTOYAGE STRICT DES FANTÔMES
+    // 📦 RECEPTION FLUX BASE64 PAR PIPELINE CONTINU
+    socket.on('send_chunk', (data) => {
+        const { fileId, chunkIndex, chunkData, totalChunks, roomId, name, mimeType } = data;
+        
+        if (!activeTransfers.has(fileId)) {
+            activeTransfers.set(fileId, {
+                roomId,
+                name,
+                mimeType,
+                totalChunks,
+                chunksReceived: 0,
+                buffer: []
+            });
+        }
+
+        const transfer = activeTransfers.get(fileId);
+        if (!transfer) return;
+
+        // Convertit la chaîne Base64 reçue en Buffer binaire Node.js
+        transfer.buffer[chunkIndex] = Buffer.from(chunkData, 'base64');
+        transfer.chunksReceived++;
+
+        const progress = Math.round((transfer.chunksReceived / transfer.totalChunks) * 100);
+        io.to(transfer.roomId).emit('transfer_progress', { fileId, progress });
+
+        if (transfer.chunksReceived === transfer.totalChunks) {
+            console.log(`🚀 [STREAM DONE] ${transfer.name} réassemblé (${transfer.totalChunks} chunks Base64).`);
+            
+            const finalContent = Buffer.concat(transfer.buffer);
+
+            io.to(transfer.roomId).emit('receive_message', {
+                type: 'file',
+                name: transfer.name,
+                mimeType: transfer.mimeType,
+                content: finalContent
+            });
+
+            activeTransfers.delete(fileId);
+        }
+    });
+
+    // ❌ NETTOYAGE STRICT DES SESSIONS À LA DÉCONNEXION
     socket.on('disconnect', () => {
         connectedUsers.delete(socket.id);
         console.log(`❌ [SERVEUR] Déconnexion propre -> ID: ${socket.id}`);
     });
 });
 
-// Nettoyage de sécurité secondaire (toutes les 60 secondes, on vire les sockets inactives)
+// Nettoyage de sécurité secondaire toutes les 60 secondes pour évacuer les inactifs
 setInterval(() => {
     const now = Date.now();
     for (let [id, user] of connectedUsers.entries()) {
-        if (now - user.updatedAt > 30000) { // Pas de signal GPS depuis 30s
+        if (now - user.updatedAt > 30000) { // Pas de rafraîchissement GPS depuis 30 secondes
             connectedUsers.delete(id);
             console.log(`🧹 [NETTOYAGE] Session expirée supprimée en RAM : ${id}`);
         }
