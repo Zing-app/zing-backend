@@ -34,37 +34,81 @@ function getDistance(lat1, lon1, lat2, lon2) {
 io.on('connection', (socket) => {
     console.log(`🔌 [SERVEUR] Connexion établie -> ID: ${socket.id}`);
 
-    // 📍 RECEPTION & MATCHMAKING GPS
+    // 📍 RECEPTION & MATCHMAKING GPS AVEC CODE PIN DE SÉCURITÉ (Version Ultra-Stable)
     socket.on('update_location', (coords) => {
-        if (!coords?.latitude || !coords?.longitude) return;
+        if (!coords || !coords.latitude || !coords.longitude) return;
 
-        // Mise à jour ou création de l'utilisateur dans la Map
-        connectedUsers.set(socket.id, { lat: coords.latitude, lng: coords.longitude, updatedAt: Date.now() });
-        console.log(`📍 [GPS] ID ${socket.id.substring(0, 5)}... : [${coords.latitude.toFixed(4)}, ${coords.longitude.toFixed(4)}]`);
+        // Récupération sécurisée de l'ancien état utilisateur pour éviter le ?.
+        let currentUser = connectedUsers.get(socket.id) || { pin: null, isVerified: false };
 
-        // Boucle de tracking de proximité croisée
+        connectedUsers.set(socket.id, {
+            lat: coords.latitude,
+            lng: coords.longitude,
+            updatedAt: Date.now(),
+            pin: currentUser.pin,
+            isVerified: currentUser.isVerified
+        });
+
+        // Boucle de vérification de proximité
         for (let [otherId, otherUser] of connectedUsers.entries()) {
             if (otherId === socket.id) continue;
 
             const distance = getDistance(coords.latitude, coords.longitude, otherUser.lat, otherUser.lng);
             const roomName = `room_${[socket.id, otherId].sort().join('_')}`;
 
-            if (distance <= 80) { // Rayon de tolérance de 80m validé en intérieur 🏠
-                socket.join(roomName);
-                io.sockets.sockets.get(otherId)?.join(roomName);
+            if (distance <= 80) {
+                let myCurrentState = connectedUsers.get(socket.id);
 
-                io.to(roomName).emit('near_user_found', { roomId: roomName, distance: distance.toFixed(1) });
-                console.log(`👥 [MATCH] Proximité détectée (${distance.toFixed(1)}m) entre ${socket.id.substring(0, 5)} et ${otherId.substring(0, 5)}`);
+                // Si aucun PIN n'est généré pour ce duo, on crée un code unique
+                if (myCurrentState && !myCurrentState.pin && !otherUser.pin) {
+                    const sharedPin = Math.floor(1000 + Math.random() * 9000).toString(); // Ex: "4732"
+
+                    myCurrentState.pin = sharedPin;
+                    otherUser.pin = sharedPin;
+
+                    // On envoie le PIN aux deux appareils pour affichage
+                    io.to(socket.id).emit('pin_generated', { pin: sharedPin, distance: distance.toFixed(1) });
+                    io.to(otherId).emit('pin_generated', { pin: sharedPin, distance: distance.toFixed(1) });
+                    console.log(`🔐 [PIN] Code ${sharedPin} généré pour la proximité.`);
+                }
             } else {
-                // Rupture de portée
+                // Hors de portée -> Nettoyage strict
                 if (socket.rooms.has(roomName)) {
                     socket.leave(roomName);
-                    io.sockets.sockets.get(otherId)?.leave(roomName);
+                    let targetSocket = io.sockets.sockets.get(otherId);
+                    if (targetSocket) targetSocket.leave(roomName);
+
+                    let myState = connectedUsers.get(socket.id);
+                    if (myState) { myState.pin = null; myState.isVerified = false; }
+                    otherUser.pin = null;
+                    otherUser.isVerified = false;
+
                     io.to(socket.id).emit('room_lost');
                     io.to(otherId).emit('room_lost');
-                    console.log(`🏃‍♂️ [PORTÉE] Écart trop grand (${distance.toFixed(1)}m). Salon détruit.`);
                 }
             }
+        }
+    });
+
+    // 🔓 ÉCOUTE DE LA VALIDATION DU PIN
+    socket.on('verify_pin', (data) => {
+        const user = connectedUsers.get(socket.id);
+        if (user && user.pin === data.pin) {
+            user.isVerified = true;
+
+            // Trouver l'autre utilisateur pour ouvrir la room
+            for (let [otherId, otherUser] of connectedUsers.entries()) {
+                if (otherId !== socket.id && otherUser.pin === data.pin && otherUser.isVerified) {
+                    const roomName = `room_${[socket.id, otherId].sort().join('_')}`;
+                    socket.join(roomName);
+                    io.sockets.sockets.get(otherId)?.join(roomName);
+
+                    io.to(roomName).emit('near_user_found', { roomId: roomName, distance: "Confirmée" });
+                    console.log(`🔓 [ACCESS] Code PIN validé. Room éphémère activée : ${roomName}`);
+                }
+            }
+        } else {
+            socket.emit('pin_error', { message: "Code PIN incorrect" });
         }
     });
 
